@@ -21,21 +21,8 @@ Baseline stock time-series forecasting example using a sliding-window RandomFore
      --horizon 20 \
      --output forecast.csv
    ```
-3. (Optional) Add walk-forward backtesting and persist metrics:
-   ```bash
-   python stock_forecast.py \
-     --data your_prices.csv \
-     --date-col date \
-     --price-col close \
-     --lookback 60 \
-     --horizon 20 \
-     --output forecast.csv \
-     --backtest-output backtest.csv
-   ```
-4. Review validation metrics printed to stdout and the saved `forecast.csv`, which
-   contains a 20-day trajectory for the predicted closing price. When enabled,
-   `backtest.csv` stores walk-forward fold metrics (MAE/RMSE/R²) with their
-   corresponding cutoff dates.
+3. Review validation metrics printed to stdout and the saved `forecast.csv`, which
+   contains a 20-day trajectory for the predicted closing price.
 
 The script trains on sliding windows of historical prices plus simple technical
 indicators (returns, moving averages, volatility) and produces a multi-output
