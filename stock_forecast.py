@@ -48,6 +48,18 @@ class ForecastConfig:
     n_estimators: int = 400
     random_state: int = 42
     output_path: Path = Path("forecast.csv")
+    backtest_output: Optional[Path] = None
+
+
+def default_feature_columns(price_col: str) -> List[str]:
+    return [
+        price_col,
+        "log_return",
+        "ma_5",
+        "ma_20",
+        "vol_5",
+        "vol_20",
+    ]
 
 
 def load_price_data(path: Path, date_col: str, price_col: str) -> pd.DataFrame:
@@ -141,18 +153,69 @@ def forecast_future(
     return pd.DataFrame({"date": future_dates, f"predicted_{target_col}": forecast_values})
 
 
+def walk_forward_backtest(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    target_col: str,
+    lookback: int,
+    horizon: int,
+    n_estimators: int,
+    random_state: int,
+    step: Optional[int] = None,
+) -> pd.DataFrame:
+    """Perform walk-forward backtesting over the full series.
+
+    For each cutoff point, the model trains on all data up to that date and
+    forecasts the next ``horizon`` days. Metrics are computed against the
+    realized prices for those future days.
+    """
+
+    step = step or horizon
+    cutoffs = range(lookback + horizon, len(df) - horizon + 1, step)
+    records = []
+
+    for cutoff in cutoffs:
+        train_df = df.iloc[:cutoff]
+        X_train, y_train = build_sliding_windows(
+            train_df,
+            feature_cols=feature_cols,
+            target_col=target_col,
+            lookback=lookback,
+            horizon=horizon,
+        )
+
+        if len(X_train) == 0:
+            continue
+
+        scaler = StandardScaler().fit(X_train)
+        model = train_model(
+            scaler.transform(X_train),
+            y_train,
+            random_state=random_state,
+            n_estimators=n_estimators,
+        )
+
+        latest_window = train_df[feature_cols].iloc[-lookback:].values.flatten().reshape(1, -1)
+        preds = model.predict(scaler.transform(latest_window))[0]
+        actuals = df[target_col].iloc[cutoff : cutoff + horizon].values
+
+        records.append(
+            {
+                "cutoff_date": train_df.iloc[-1]["date"],
+                "mae": mean_absolute_error(actuals, preds),
+                "rmse": float(np.sqrt(mean_squared_error(actuals, preds))),
+                "r2": r2_score(actuals, preds),
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
 def run_pipeline(config: ForecastConfig) -> Tuple[MultiOutputRegressor, dict, pd.DataFrame]:
     raw = load_price_data(config.data_path, config.date_col, config.price_col)
     enriched = add_indicators(raw, config.price_col)
 
-    feature_cols = [
-        config.price_col,
-        "log_return",
-        "ma_5",
-        "ma_20",
-        "vol_5",
-        "vol_20",
-    ]
+    feature_cols = default_feature_columns(config.price_col)
 
     X, y = build_sliding_windows(
         enriched,
@@ -200,6 +263,26 @@ def run_pipeline(config: ForecastConfig) -> Tuple[MultiOutputRegressor, dict, pd
     return full_model, metrics, forecast_df
 
 
+def run_backtest(config: ForecastConfig) -> pd.DataFrame:
+    raw = load_price_data(config.data_path, config.date_col, config.price_col)
+    enriched = add_indicators(raw, config.price_col)
+
+    backtest_df = walk_forward_backtest(
+        enriched,
+        feature_cols=default_feature_columns(config.price_col),
+        target_col=config.price_col,
+        lookback=config.lookback,
+        horizon=config.horizon,
+        n_estimators=config.n_estimators,
+        random_state=config.random_state,
+    )
+
+    if backtest_df.empty:
+        raise ValueError("Backtest produced no results. Ensure the dataset is long enough.")
+
+    return backtest_df
+
+
 def parse_args() -> ForecastConfig:
     parser = argparse.ArgumentParser(description="Train a baseline stock forecaster")
     parser.add_argument("--data", type=Path, required=True, help="Path to CSV with price data")
@@ -220,6 +303,12 @@ def parse_args() -> ForecastConfig:
         help="Where to write the forecast CSV",
     )
     parser.add_argument(
+        "--backtest-output",
+        type=Path,
+        default=None,
+        help="Optional path to write walk-forward backtest metrics",
+    )
+    parser.add_argument(
         "--random-state",
         type=int,
         default=42,
@@ -236,6 +325,7 @@ def parse_args() -> ForecastConfig:
         n_estimators=args.n_estimators,
         random_state=args.random_state,
         output_path=args.output,
+        backtest_output=args.backtest_output,
     )
 
 
@@ -249,6 +339,13 @@ def main() -> None:
 
     forecast_df.to_csv(config.output_path, index=False)
     print(f"Saved {len(forecast_df)}-day forecast to {config.output_path}")
+
+    if config.backtest_output:
+        backtest_df = run_backtest(config)
+        backtest_df.to_csv(config.backtest_output, index=False)
+        print("Backtest summary (mean over folds):")
+        print(backtest_df[["mae", "rmse", "r2"]].mean().to_string())
+        print(f"Saved walk-forward backtest metrics to {config.backtest_output}")
 
 
 if __name__ == "__main__":
